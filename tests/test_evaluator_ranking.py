@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from core.evaluator import RAGEvaluator, _relevance_grade
+from core.evaluator import RAGEvaluator, _relevance_grade, _resolve_skills
 from core.ir_metrics import RankingMetrics
 from core.rerank_eval import RerankerMetrics
 
@@ -18,9 +18,10 @@ from core.rerank_eval import RerankerMetrics
 class _FakeHybridIndexer:
     """Minimal stand-in for HybridIndexer: fixed search results + full corpus metadata."""
 
-    def __init__(self, search_results, all_metadata):
+    def __init__(self, search_results, all_metadata, resume_texts=None):
         self._search_results = search_results
         self.resume_metadata = all_metadata
+        self.resume_texts = resume_texts or ["" for _ in all_metadata]
 
     def search_resumes(self, query, top_k=5):
         return self._search_results[:top_k]
@@ -44,6 +45,24 @@ SEARCH_RESULTS = [
 def _make_evaluator() -> RAGEvaluator:
     indexer = _FakeHybridIndexer(SEARCH_RESULTS, ALL_METADATA)
     return RAGEvaluator(vector_store=None, hybrid_indexer=indexer)
+
+
+# ---------------------------------------------------------------------------
+# _resolve_skills
+# ---------------------------------------------------------------------------
+
+class TestResolveSkills:
+    def test_prefers_structured_skills_when_present(self):
+        skills = _resolve_skills(["Python"], "no python here", ["Python", "SQL"])
+        assert skills == ["Python"]
+
+    def test_falls_back_to_text_when_structured_skills_empty(self):
+        skills = _resolve_skills([], "Senior Python developer with SQL experience", ["Python", "SQL", "AWS"])
+        assert set(skills) == {"Python", "SQL"}
+
+    def test_text_fallback_finds_nothing_when_absent(self):
+        skills = _resolve_skills([], "Java developer with Spring Boot", ["Python", "SQL"])
+        assert skills == []
 
 
 # ---------------------------------------------------------------------------
@@ -101,6 +120,25 @@ class TestEvaluateRankingQuality:
         assert metrics.recall_at_k[3] == 0.0
         assert metrics.mrr == 0.0
 
+    def test_falls_back_to_text_when_no_structured_skills_indexed(self):
+        # Simulates indexing without GOOGLE_API_KEY: every candidate's
+        # structured `skills` metadata is empty, but relevance should still
+        # be inferred from the raw resume text.
+        unparsed_metadata = [{"candidate_id": m["candidate_id"], "skills": []} for m in ALL_METADATA]
+        resume_texts = [
+            "python sql aws developer",
+            "java spring developer",
+            "python aws engineer",
+            "kotlin android developer",
+        ]
+        indexer = _FakeHybridIndexer(SEARCH_RESULTS, unparsed_metadata, resume_texts)
+        evaluator = RAGEvaluator(vector_store=None, hybrid_indexer=indexer)
+
+        metrics = evaluator.evaluate_ranking_quality(
+            "python developer", expected_skills=["python", "sql", "aws"], top_k=3, k_values=(3,)
+        )
+        assert metrics.recall_at_k[3] == 1.0
+
 
 # ---------------------------------------------------------------------------
 # evaluate_reranker_quality
@@ -125,3 +163,28 @@ class TestEvaluateRerankerQuality:
                 "python developer", expected_skills=["Python", "SQL", "AWS"], top_k=3
             )
         assert metrics.ndcg_after >= metrics.ndcg_before
+
+    def test_relevance_judgment_uses_text_fallback_without_structured_skills(self):
+        # The rule-based re-ranker itself only looks at structured `skills`
+        # (like the real production pipeline), so with none available it
+        # can't distinguish the candidates and leaves their order unchanged.
+        # The relevance *judgment* used to score that ranking, however,
+        # should still be inferred from text rather than defaulting to zero
+        # for every candidate.
+        indexer = _FakeHybridIndexer(
+            search_results=[
+                {"candidate_id": "c2", "name": "Bob", "skills": [], "text": "java spring developer"},
+                {"candidate_id": "c1", "name": "Alice", "skills": [], "text": "python sql aws developer"},
+            ],
+            all_metadata=ALL_METADATA,
+        )
+        with patch("core.re_ranker.GOOGLE_API_KEY", ""):
+            evaluator = RAGEvaluator(vector_store=None, hybrid_indexer=indexer)
+            metrics = evaluator.evaluate_reranker_quality(
+                "python developer", expected_skills=["Python", "SQL", "AWS"], top_k=2
+            )
+        # Ordering is untouched (reranker had nothing to go on), so before
+        # and after NDCG are identical — but not both zero, which would
+        # indicate the text fallback wasn't applied.
+        assert metrics.ndcg_uplift == 0.0
+        assert metrics.ndcg_before > 0.0

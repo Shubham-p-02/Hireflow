@@ -55,6 +55,22 @@ def _relevance_grade(candidate_skills: List[str], expected_skills: List[str]) ->
     return 0.0
 
 
+def _resolve_skills(structured_skills: List[str], resume_text: str, expected_skills: List[str]) -> List[str]:
+    """Return the skills to grade a candidate on.
+
+    Structured `skills` metadata comes from Gemini-based parsing
+    (core/parsing.py) at index time, so it's empty whenever GOOGLE_API_KEY
+    isn't configured. Rather than silently grading every candidate as
+    irrelevant in that case, fall back to treating an expected skill as
+    present if it appears as a substring of the raw resume text — a cruder
+    signal than structured extraction, but one that needs no LLM calls.
+    """
+    if structured_skills:
+        return structured_skills
+    text_lower = (resume_text or "").lower()
+    return [skill for skill in expected_skills if skill.lower() in text_lower]
+
+
 @dataclass
 class RAGEvaluationMetrics:
     """Container for RAGAS evaluation metrics with scoring"""
@@ -106,10 +122,12 @@ class RAGEvaluator:
         ranked = self.hybrid_indexer.search_resumes(query, top_k=top_k)
         ranked_ids = [c.get('candidate_id', '') for c in ranked]
 
-        relevance = {
-            meta.get('candidate_id', ''): _relevance_grade(meta.get('skills', []), expected_skills)
-            for meta in self.hybrid_indexer.resume_metadata
-        }
+        resume_texts = self.hybrid_indexer.resume_texts
+        relevance = {}
+        for i, meta in enumerate(self.hybrid_indexer.resume_metadata):
+            text = resume_texts[i] if i < len(resume_texts) else ""
+            skills = _resolve_skills(meta.get('skills', []), text, expected_skills)
+            relevance[meta.get('candidate_id', '')] = _relevance_grade(skills, expected_skills)
 
         judgment = QueryJudgment(query=query, ranked_ids=ranked_ids, relevance=relevance)
         return evaluate_ranking([judgment], k_values=k_values)
@@ -130,7 +148,10 @@ class RAGEvaluator:
         candidates = self.hybrid_indexer.search_resumes(query, top_k=top_k)
         pre_rerank_ids = [c.get('candidate_id', '') for c in candidates]
         relevance = {
-            c.get('candidate_id', ''): _relevance_grade(c.get('skills', []), expected_skills)
+            c.get('candidate_id', ''): _relevance_grade(
+                _resolve_skills(c.get('skills', []), c.get('text', ''), expected_skills),
+                expected_skills,
+            )
             for c in candidates
         }
 
