@@ -25,14 +25,15 @@ class VectorStore:
         self.client = None
         self.index = None
         self.embeddings = None
-        self._ready = None
+        self._ready = False
 
     def initialize(self) -> bool:
+        self._ready = False
         try:
             if not PINECONE_API_KEY:
                 logger.warning("PINECONE API Key not set. Vector store disabled.")
                 return False
-            
+
             self.client = Pinecone(api_key=PINECONE_API_KEY)
             logger.info("Pinecone client initialized.")
 
