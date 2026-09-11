@@ -1,6 +1,21 @@
-"""
-RAGAS-based evaluation system for measuring search quality.
-Evaluates retrieval and answer generation performance using standard metrics.
+"""Search quality evaluation for HireFlow.
+
+Two complementary evaluation paths:
+
+- `evaluate_ranking_quality` / `evaluate_reranker_quality` — deterministic
+  Precision@K/Recall@K/MRR/NDCG metrics (core/ir_metrics.py,
+  core/rerank_eval.py) scored against a heuristic skill-overlap relevance
+  judgment. No LLM calls, no external dependencies beyond the index itself —
+  this is the primary way to measure whether the hybrid search and re-ranker
+  are actually surfacing good candidates.
+- `evaluate_search_quality` — optional RAGAS-based evaluation (answer
+  relevancy, context precision, faithfulness, answer correctness) using
+  Gemini as judge. RAGAS is designed for QA/RAG answer generation rather
+  than ranked retrieval, so treat it as a secondary, LLM-cost-incurring
+  sanity check rather than the primary quality signal. Its dependencies
+  (ragas, datasets, the Gemini/HuggingFace clients) are imported lazily so
+  that constructing a RAGEvaluator and calling the ranking-metrics methods
+  above never requires them.
 """
 
 import sys
@@ -9,15 +24,36 @@ from typing import Dict, Any, List
 import numpy as np
 import pandas as pd
 from dataclasses import dataclass
-from core.search_router import SearchRouter
+from core.ir_metrics import QueryJudgment, RankingMetrics, evaluate_ranking
+from core.rerank_eval import RerankerMetrics, evaluate_reranker
 from utils.utils import get_logger
 from utils.config import GOOGLE_API_KEY, LLM_MODEL
-from ragas import evaluate
-from ragas.metrics import (
-    answer_relevancy, context_precision, faithfulness, answer_correctness
-)
 
 logger = get_logger(__name__)
+
+
+def _relevance_grade(candidate_skills: List[str], expected_skills: List[str]) -> float:
+    """Heuristic relevance grade in {0, 1, 2} from required-skill overlap.
+
+    2 = strong match (>=80% of expected skills present), 1 = partial match
+    (>=40%), 0 = weak/no match/no expected skills given. Used as a
+    ground-truth proxy for ranking metrics when no human-labeled relevance
+    judgments are available.
+    """
+    if not expected_skills:
+        return 0.0
+    candidate_lower = {s.lower() for s in candidate_skills}
+    expected_lower = {s.lower() for s in expected_skills}
+    if not expected_lower:
+        return 0.0
+    matched = candidate_lower & expected_lower
+    ratio = len(matched) / len(expected_lower)
+    if ratio >= 0.8:
+        return 2.0
+    if ratio >= 0.4:
+        return 1.0
+    return 0.0
+
 
 @dataclass
 class RAGEvaluationMetrics:
@@ -27,7 +63,7 @@ class RAGEvaluationMetrics:
     faithfulness: float         # Factual consistency with context
     answer_correctness: float   # Overall answer quality
     overall_score: float        # Weighted average of all metrics
-    
+
     def to_dict(self) -> Dict[str, float]:
         """Convert metrics to dictionary format"""
         return {
@@ -39,20 +75,97 @@ class RAGEvaluationMetrics:
         }
 
 class RAGEvaluator:
-    """RAGAS-powered search quality evaluator with history tracking"""
+    """Search quality evaluator: fast IR ranking metrics + optional RAGAS metrics."""
 
     def __init__(self, vector_store, hybrid_indexer):
-        """Initialize RAGAS metrics and evaluation tracking"""
-        self.ragas_metrics = [
-            answer_relevancy, context_precision, faithfulness, answer_correctness
-        ]
+        """Store dependencies. RAGAS's LLM/embeddings clients are built lazily
+        on first use (see `_ensure_ragas_ready`) so construction never
+        requires GOOGLE_API_KEY or the ragas/datasets packages."""
         self.evaluation_history = []  # Track all evaluations
         self.vector_store = vector_store
         self.hybrid_indexer = hybrid_indexer
 
-        # Use Gemini as RAGAS LLM (instead of default OpenAI)
+        self.ragas_metrics = None
+        self.ragas_llm = None
+        self.ragas_embeddings = None
+
+    # ------------------------------------------------------------------ #
+    #  IR ranking metrics (fast, no LLM) — primary evaluation path         #
+    # ------------------------------------------------------------------ #
+
+    def evaluate_ranking_quality(self, query: str, expected_skills: List[str],
+                                  top_k: int = 10, k_values: tuple = (3, 5, 10)) -> RankingMetrics:
+        """Score the hybrid search's ranking with Precision/Recall/NDCG@k, MRR, MAP.
+
+        Relevance judgments are the heuristic skill-overlap grade
+        (`_relevance_grade`) computed for every indexed candidate, not just
+        the ones returned — so recall/NDCG reflect whether truly relevant
+        candidates elsewhere in the index were missed, not just how good the
+        top-k look in isolation.
+        """
+        ranked = self.hybrid_indexer.search_resumes(query, top_k=top_k)
+        ranked_ids = [c.get('candidate_id', '') for c in ranked]
+
+        relevance = {
+            meta.get('candidate_id', ''): _relevance_grade(meta.get('skills', []), expected_skills)
+            for meta in self.hybrid_indexer.resume_metadata
+        }
+
+        judgment = QueryJudgment(query=query, ranked_ids=ranked_ids, relevance=relevance)
+        return evaluate_ranking([judgment], k_values=k_values)
+
+    def evaluate_reranker_quality(self, query: str, expected_skills: List[str],
+                                   job_title: str = "", top_k: int = 5) -> RerankerMetrics:
+        """Check whether LLM re-ranking improves ordering over the raw hybrid search.
+
+        Reports the Spearman correlation between the re-ranker's fit_score
+        and the true relevance grade, plus the NDCG@k of the ranking before
+        vs. after re-ranking (`ndcg_uplift`). A near-zero correlation or
+        negative uplift signals the re-ranker isn't adding value over the
+        hybrid search's own ordering.
+        """
+        from core.re_ranker import ReRanker
+        from utils.schemas import SearchQuery
+
+        candidates = self.hybrid_indexer.search_resumes(query, top_k=top_k)
+        pre_rerank_ids = [c.get('candidate_id', '') for c in candidates]
+        relevance = {
+            c.get('candidate_id', ''): _relevance_grade(c.get('skills', []), expected_skills)
+            for c in candidates
+        }
+
+        jd = SearchQuery(title=job_title, text=query, required_skills=expected_skills)
+        reranker = ReRanker()
+        evaluations = reranker.re_rank_candidates(candidates, jd)
+
+        post_rerank_ids = [e.candidate_id for e in evaluations]
+        fit_scores_by_id = {e.candidate_id: float(e.fit_score) for e in evaluations}
+
+        return evaluate_reranker(pre_rerank_ids, post_rerank_ids, fit_scores_by_id, relevance, k=top_k)
+
+    # ------------------------------------------------------------------ #
+    #  RAGAS metrics (LLM-judged, optional secondary check)                #
+    # ------------------------------------------------------------------ #
+
+    def _ensure_ragas_ready(self):
+        """Lazily import ragas and build its Gemini LLM + embeddings clients.
+
+        Isolated behind this method so `ragas`/`datasets` and a configured
+        GOOGLE_API_KEY are only required when RAGAS evaluation is actually
+        invoked, not for constructing a RAGEvaluator or using the IR metrics.
+        """
+        if self.ragas_metrics is not None:
+            return
+
+        from ragas.metrics import (
+            answer_relevancy, context_precision, faithfulness, answer_correctness
+        )
         from langchain_google_genai import ChatGoogleGenerativeAI
         from langchain_community.embeddings import HuggingFaceEmbeddings
+
+        self.ragas_metrics = [
+            answer_relevancy, context_precision, faithfulness, answer_correctness
+        ]
         self.ragas_llm = ChatGoogleGenerativeAI(
             model=LLM_MODEL,
             google_api_key=GOOGLE_API_KEY,
@@ -61,26 +174,27 @@ class RAGEvaluator:
         self.ragas_embeddings = HuggingFaceEmbeddings(
             model_name="sentence-transformers/all-MiniLM-L6-v2"
         )
-    
-    def evaluate_search_quality(self, query: str, expected_skills: List[str], 
+
+    def evaluate_search_quality(self, query: str, expected_skills: List[str],
                               search_mode: str = "deep", top_k: int = 5) -> RAGEvaluationMetrics:
         """Run search and evaluate results using RAGAS quality metrics"""
-        
+
         try:
             # Create search router instance
+            from core.search_router import SearchRouter
             search_router = SearchRouter(self.vector_store, self.hybrid_indexer)
             search_result = search_router.search(query, top_k, search_mode=search_mode)
-            
+
             if not search_result.get('results'):
                 return self.create_default_metrics()
-            
+
             candidates = search_result['results']
             return self.evaluate_with_ragas(query, candidates, expected_skills)
-                
+
         except Exception as e:
             logger.error(f"Search quality evaluation failed: {e}")
             return self.create_default_metrics()
-    
+
     def create_default_metrics(self) -> RAGEvaluationMetrics:
         """Return zero metrics when search fails or returns no results"""
         return RAGEvaluationMetrics(
@@ -90,13 +204,20 @@ class RAGEvaluator:
             answer_correctness=0.0,
             overall_score=0.0
         )
-    
-    def evaluate_with_ragas(self, query: str, candidates: List[Dict], 
+
+    def evaluate_with_ragas(self, query: str, candidates: List[Dict],
                             expected_skills: List[str]) -> RAGEvaluationMetrics:
         """Run RAGAS evaluation on search results and calculate final metrics"""
-        
+
+        try:
+            self._ensure_ragas_ready()
+        except Exception as e:
+            logger.warning(f"RAGAS is unavailable ({e}), returning defaults")
+            return self.create_default_metrics()
+
         evaluation_data = self.prepare_ragas_data(query, candidates, expected_skills)
         from datasets import Dataset
+        from ragas import evaluate
         hf_data = Dataset.from_pandas(evaluation_data)
         # RAGAS may return a single float OR a list of per-row scores.
         # Normalise to a single float; treat nan as 0.0.
@@ -138,16 +259,16 @@ class RAGEvaluator:
             answer_correctness=_get_metric('answer_correctness'),
             overall_score=0.0
         )
-        
+
         metrics.overall_score = self.calculate_overall_score(metrics)
         self.store_evaluation(query, metrics)
-        
+
         return metrics
-    
-    def prepare_ragas_data(self, query: str, candidates: List[Dict], 
+
+    def prepare_ragas_data(self, query: str, candidates: List[Dict],
                            expected_skills: List[str]) -> pd.DataFrame:
         """Convert search results to RAGAS-compatible DataFrame format"""
-        
+
         data = []
         for candidate in candidates:
             metadata = candidate.get('metadata', {})
@@ -190,18 +311,18 @@ class RAGEvaluator:
                 'ground_truth': ground_truth,
                 'answer': generated_answer
             })
-        
+
         return pd.DataFrame(data)
-    
+
     def create_ground_truth(self, candidate_skills: List[str], expected_skills: List[str]) -> str:
         """Generate ground truth labels based on skill matching percentage"""
         if not expected_skills:
             return "No skills specified"
-         
-        matched_skills = [skill for skill in expected_skills 
+
+        matched_skills = [skill for skill in expected_skills
                          if skill.lower() in [s.lower() for s in candidate_skills]]
         match_percentage = len(matched_skills) / len(expected_skills)
-        
+
         if match_percentage >= 0.8:
             return f"Excellent match: {len(matched_skills)}/{len(expected_skills)} skills"
         elif match_percentage >= 0.6:
@@ -210,7 +331,7 @@ class RAGEvaluator:
             return f"Moderate match: {len(matched_skills)}/{len(expected_skills)} skills"
         else:
             return f"Poor match: {len(matched_skills)}/{len(expected_skills)} skills"
-    
+
     def calculate_overall_score(self, metrics: RAGEvaluationMetrics) -> float:
         """Compute weighted average of all RAGAS metrics"""
         weights = {
@@ -219,16 +340,14 @@ class RAGEvaluator:
             'faithfulness': 0.20,
             'answer_correctness': 0.20
         }
-        
-        overall_score = (
-            np.mean(metrics.answer_relevancy) * weights['answer_relevancy'] +
-            np.mean(metrics.context_precision) * weights['context_precision'] +
-            np.mean(metrics.faithfulness) * weights['faithfulness'] +
-            np.mean(metrics.answer_correctness) * weights['answer_correctness']
+
+        return (
+            metrics.answer_relevancy * weights['answer_relevancy'] +
+            metrics.context_precision * weights['context_precision'] +
+            metrics.faithfulness * weights['faithfulness'] +
+            metrics.answer_correctness * weights['answer_correctness']
         )
-        
-        return overall_score
-    
+
     def store_evaluation(self, query: str, metrics: RAGEvaluationMetrics):
         """Save evaluation results to history for later analysis"""
         evaluation_record = {
@@ -236,27 +355,27 @@ class RAGEvaluator:
             'timestamp': pd.Timestamp.now(),
             'metrics': metrics.to_dict()
         }
-        
+
         self.evaluation_history.append(evaluation_record)
-    
+
     def get_evaluation_summary(self) -> Dict[str, Any]:
         """Get summary statistics of all evaluations performed"""
         if not self.evaluation_history:
             return {"message": "No evaluations performed yet"}
-        
+
         # Calculate averages
         avg_metrics = {}
-        for metric in ['answer_relevancy', 'context_precision', 'faithfulness', 
+        for metric in ['answer_relevancy', 'context_precision', 'faithfulness',
                       'answer_correctness', 'overall_score']:
             values = [record['metrics'][metric] for record in self.evaluation_history]
             avg_metrics[f'avg_{metric}'] = sum(values) / len(values)
-        
+
         return {
             'total_evaluations': len(self.evaluation_history),
             'average_metrics': avg_metrics,
             'recent_evaluations': self.evaluation_history[-5:]
         }
-    
+
     def export_evaluations(self, filename: str = "rag_evaluations.csv") -> bool:
         """Export all evaluation history to CSV file for analysis"""
         if not self.evaluation_history:
@@ -302,7 +421,26 @@ if __name__ == "__main__":
     indexer.index_resumes(sample_docs)
     evaluator = RAGEvaluator(vector_store=indexer.vector_store, hybrid_indexer=indexer)
 
-    print("=== create_default_metrics ===")
+    print("=== evaluate_ranking_quality (fast IR metrics, no LLM) ===")
+    ranking_metrics = evaluator.evaluate_ranking_quality(
+        query="Python developer with SQL and AWS",
+        expected_skills=["Python", "SQL", "AWS"],
+        top_k=2,
+        k_values=(1, 2),
+    )
+    for k, v in ranking_metrics.to_dict().items():
+        print(f"  {k}: {v}")
+
+    print("\n=== evaluate_reranker_quality (fast IR metrics, no LLM) ===")
+    reranker_metrics = evaluator.evaluate_reranker_quality(
+        query="Python developer with SQL and AWS",
+        expected_skills=["Python", "SQL", "AWS"],
+        top_k=2,
+    )
+    for k, v in reranker_metrics.to_dict().items():
+        print(f"  {k}: {v}")
+
+    print("\n=== create_default_metrics ===")
     defaults = evaluator.create_default_metrics()
     print("Default metrics:", defaults.to_dict())
 

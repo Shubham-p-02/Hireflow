@@ -44,7 +44,7 @@ pytest tests/ -v
 ```
 
 All tests are self-contained (Pinecone and Gemini are mocked). You should see
-tests passing for: `test_filters`, `test_hybrid_indexer`, `test_re_ranker`, `test_ingestion`.
+tests passing for: `test_filters`, `test_hybrid_indexer`, `test_re_ranker`, `test_ingestion`, `test_ir_metrics`, `test_rerank_eval`, `test_evaluator_ranking`.
 
 ---
 
@@ -185,6 +185,46 @@ This triggers a full BM25 + Pinecone rebuild.
 
 ---
 
+### Feature 11 — IR ranking metrics (search & re-ranker quality)
+
+RAGAS metrics (Feature 9) are QA/RAG metrics — they judge a generated answer
+against context, not how good a *ranked list* of candidates is. To actually
+measure the hybrid search and re-ranker, `core/evaluator.py` also exposes
+standard information-retrieval metrics (Precision@K, Recall@K, MRR, NDCG@K,
+MAP) computed against a heuristic skill-overlap relevance judgment. These
+need no LLM calls, so they're fast and deterministic:
+
+```python
+from core.evaluator import RAGEvaluator
+
+evaluator = RAGEvaluator(vector_store, hybrid_indexer)
+
+# How good is the hybrid search's ranking?
+ranking_metrics = evaluator.evaluate_ranking_quality(
+    query="Senior Accountant with QuickBooks",
+    expected_skills=["QuickBooks", "Tax Preparation", "Excel"],
+    top_k=10,
+)
+print(ranking_metrics.to_dict())
+# {'mrr': 0.83, 'map': 0.71, 'precision@3': 0.67, 'recall@10': 1.0, 'ndcg@10': 0.88, ...}
+
+# Does LLM re-ranking actually improve on the raw hybrid ranking?
+reranker_metrics = evaluator.evaluate_reranker_quality(
+    query="Senior Accountant with QuickBooks",
+    expected_skills=["QuickBooks", "Tax Preparation", "Excel"],
+    top_k=5,
+)
+print(reranker_metrics.to_dict())
+# {'fit_score_correlation': 0.74, 'ndcg_before': 0.62, 'ndcg_after': 0.81, 'ndcg_uplift': 0.19}
+```
+
+- `evaluate_ranking_quality` — Precision/Recall/NDCG@k, MRR, and MAP for the hybrid search, scored against every indexed candidate (not just the ones retrieved), so recall reflects candidates that were missed entirely.
+- `evaluate_reranker_quality` — Spearman correlation between the re-ranker's `fit_score` and true relevance, plus NDCG uplift (post-rerank NDCG minus pre-rerank NDCG). A near-zero correlation or negative uplift means re-ranking isn't adding value over the hybrid search's own order.
+
+See `core/ir_metrics.py` and `core/rerank_eval.py` for the underlying metric implementations, and `tests/test_ir_metrics.py`, `tests/test_rerank_eval.py`, `tests/test_evaluator_ranking.py` for examples.
+
+---
+
 ## Project Structure
 
 ```
@@ -200,7 +240,9 @@ Hireflow/
 │   ├── filters.py           # Post-search filtering (skills/location/experience)
 │   ├── memory_rag.py        # Search history and interaction tracking
 │   ├── search_router.py     # Shallow vs deep search routing
-│   └── evaluator.py         # RAGAS quality metrics
+│   ├── evaluator.py         # RAGAS + IR ranking metrics
+│   ├── ir_metrics.py        # Precision@K/Recall@K/MRR/NDCG@K (pure functions)
+│   └── rerank_eval.py       # Re-ranker quality vs. relevance judgments
 ├── utils/
 │   ├── schemas.py           # SearchQuery, Resume, CandidateEvaluation
 │   ├── config.py            # .env configuration loader
@@ -213,7 +255,10 @@ Hireflow/
 │   ├── test_filters.py      # Filter function tests
 │   ├── test_hybrid_indexer.py # RRF fusion and indexing tests
 │   ├── test_re_ranker.py    # Evaluation and section parsing tests
-│   └── test_ingestion.py    # PDF loading tests
+│   ├── test_ingestion.py    # PDF loading tests
+│   ├── test_ir_metrics.py   # Precision/Recall/NDCG/MRR/MAP tests
+│   ├── test_rerank_eval.py  # Spearman correlation and NDCG uplift tests
+│   └── test_evaluator_ranking.py # RAGEvaluator ranking-metrics methods
 ├── data/
 │   └── resumes/             # Place PDF resumes here
 ├── main.py                  # CLI interface

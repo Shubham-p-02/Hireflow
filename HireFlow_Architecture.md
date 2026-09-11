@@ -141,7 +141,9 @@ LLM Re-Ranking (optional, top-5 only)
 | Filters | `core/filters.py` | Post-search filtering (skills/location/exp) |
 | MemoryRAG | `core/memory_rag.py` | LangChain conversation memory |
 | SearchRouter | `core/search_router.py` | Routes to shallow or deep search strategy |
-| RAGEvaluator | `core/evaluator.py` | RAGAS quality metrics |
+| RAGEvaluator | `core/evaluator.py` | RAGAS metrics (optional, LLM-judged) + IR ranking metrics (primary) |
+| ir_metrics | `core/ir_metrics.py` | Precision@K/Recall@K/MRR/NDCG@K/MAP — pure ranking-quality functions |
+| rerank_eval | `core/rerank_eval.py` | Re-ranker quality: fit_score correlation + NDCG uplift vs. relevance judgments |
 | SearchQuery | `utils/schemas.py` | Lightweight query context dataclass |
 | Resume | `utils/schemas.py` | Pydantic resume model |
 | CandidateEvaluation | `utils/schemas.py` | Pydantic evaluation result model |
