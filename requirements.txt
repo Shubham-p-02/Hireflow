@@ -4,19 +4,25 @@ streamlit
 python-dotenv
 pydantic
 pydantic-settings
-langchain
-langchain-classic
-langchain-community
-langchain-core
-langchain-text-splitters
-langchain-google-genai
+# The langchain family below is pinned to the pre-1.0 (0.3.x) line rather than
+# left open: ragas==0.4.3 hard-imports langchain_community.chat_models.vertexai,
+# a module langchain-community removed starting in its 0.4.x release, and
+# ragas's own langchain_openai dependency pulls langchain-core>=1.2 unless
+# langchain-openai is also held to its matching 0.3.x release. An open/latest
+# install of this stack breaks that import at RAGAS-evaluation time.
+langchain==0.3.30
+langchain-community==0.3.31
+langchain-core==0.3.86
+langchain-text-splitters==0.3.11
+langchain-google-genai==2.0.11
+langchain-openai==0.3.35
 pypdf
 pinecone
 rank-bm25
 sentence-transformers
 numpy
 pandas
-ragas
+ragas==0.4.3
 datasets
 pytest
 email-validator
