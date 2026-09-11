@@ -164,13 +164,13 @@ class TestEvaluateRerankerQuality:
             )
         assert metrics.ndcg_after >= metrics.ndcg_before
 
-    def test_relevance_judgment_uses_text_fallback_without_structured_skills(self):
-        # The rule-based re-ranker itself only looks at structured `skills`
-        # (like the real production pipeline), so with none available it
-        # can't distinguish the candidates and leaves their order unchanged.
-        # The relevance *judgment* used to score that ranking, however,
-        # should still be inferred from text rather than defaulting to zero
-        # for every candidate.
+    def test_relevance_judgment_and_reranker_both_use_text_fallback(self):
+        # Neither candidate has structured `skills` metadata (unparsed
+        # resumes), but c1's text mentions all 3 required skills and c2's
+        # mentions none. Both the relevance judgment (evaluator) and the
+        # rule-based re-ranker's own scoring (re_ranker.py) now fall back to
+        # text matching, so the re-ranker should promote c1 above its
+        # pre-rerank position — a positive NDCG uplift.
         indexer = _FakeHybridIndexer(
             search_results=[
                 {"candidate_id": "c2", "name": "Bob", "skills": [], "text": "java spring developer"},
@@ -183,8 +183,6 @@ class TestEvaluateRerankerQuality:
             metrics = evaluator.evaluate_reranker_quality(
                 "python developer", expected_skills=["Python", "SQL", "AWS"], top_k=2
             )
-        # Ordering is untouched (reranker had nothing to go on), so before
-        # and after NDCG are identical — but not both zero, which would
-        # indicate the text fallback wasn't applied.
-        assert metrics.ndcg_uplift == 0.0
         assert metrics.ndcg_before > 0.0
+        assert metrics.ndcg_uplift > 0.0
+        assert metrics.fit_score_correlation > 0.0

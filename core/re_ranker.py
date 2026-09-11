@@ -234,17 +234,26 @@ class ReRanker:
             # We don't have min_experience in SearchQuery; skip experience check
             pass
 
+        # Structured `skills` metadata is only populated when resumes were
+        # parsed with Gemini (core/parsing.py) at index time — without it,
+        # every candidate would score identically (no basis for comparison).
+        # Fall back to matching required skills against the raw resume text.
+        skills = resume.skills
+        if not skills and jd.required_skills and resume.text:
+            text_lower = resume.text.lower()
+            skills = [s for s in jd.required_skills if s.lower() in text_lower]
+
         # Check skill overlap
-        if resume.skills and jd.required_skills:
+        if skills and jd.required_skills:
             required_lower = [r.lower() for r in jd.required_skills]
-            matching = [s for s in resume.skills if s.lower() in required_lower]
+            matching = [s for s in skills if s.lower() in required_lower]
             if matching:
                 strengths.append(f"Has required skills: {', '.join(matching)}")
             else:
                 gaps.append("Missing required skills")
-        elif resume.skills:
+        elif skills:
             # No specific skills required; presence of any skills is a mild positive
-            strengths.append(f"Has {len(resume.skills)} listed skills")
+            strengths.append(f"Has {len(skills)} listed skills")
 
         # fit_score = 50 + 20 per strength - 15 per gap, clamped to [0, 100]
         fit_score = max(0, min(100, 50 + len(strengths) * 20 - len(gaps) * 15))
