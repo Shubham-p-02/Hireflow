@@ -3,7 +3,7 @@ Conversation memory system for tracking search history and context.
 Uses LangChain's memory to maintain session context across searches.
 """
 
-from langchain_classic.memory import ConversationBufferMemory
+from langchain.memory import ConversationBufferMemory
 from langchain_core.messages import HumanMessage
 import logging
 

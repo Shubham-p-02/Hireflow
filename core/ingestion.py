@@ -119,8 +119,8 @@ def _print_sample_documents(docs, label: str, max_display: int = 3):
     for i, doc in enumerate(docs[:max_display]):
         meta = getattr(doc, 'metadata', {}) or {}
         print(f"[{i+1}] id: {meta.get('candidate_id', meta.get('jd_id', 'n/a'))} | filename: {meta.get('filename', meta.get('title', 'n/a'))}")
-        snippet = (getattr(doc, 'page_content', '') or '')[:200]
-        print(f"    snippet: {snippet.replace('\n', ' ')[:180]}...\n")
+        snippet = (getattr(doc, 'page_content', '') or '')[:200].replace('\n', ' ')
+        print(f"    snippet: {snippet[:180]}...\n")
 
 
 if __name__ == '__main__':

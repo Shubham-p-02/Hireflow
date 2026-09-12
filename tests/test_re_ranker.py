@@ -85,6 +85,28 @@ class TestSimpleEvaluation:
         result = reranker.simple_evaluation(resume, _make_query())
         assert result.candidate_id == "test_id_123"
 
+    def test_falls_back_to_text_when_no_structured_skills(self):
+        # No structured `skills` metadata (e.g. resume wasn't Gemini-parsed),
+        # but the default resume text mentions "Python" and "Django" — the
+        # required skills for _make_query() — so it should still score above
+        # neutral instead of being indistinguishable from a total mismatch.
+        reranker = _make_reranker_no_llm()
+        resume_no_structured_skills = _make_resume(skills=[])
+        result = reranker.simple_evaluation(resume_no_structured_skills, _make_query())
+        assert result.fit_score > 50
+        assert len(result.strengths) > 0
+
+    def test_text_fallback_finds_nothing_stays_neutral(self):
+        # Text mentions neither required skill — should stay neutral (50),
+        # not be penalized as a "gap", since we can't be sure the candidate
+        # actually lacks the skill vs. it just not appearing in the raw text.
+        reranker = _make_reranker_no_llm()
+        resume = _make_resume(skills=[])
+        resume.text = "Experienced sales associate with retail management background."
+        result = reranker.simple_evaluation(resume, _make_query())
+        assert result.fit_score == 50
+        assert result.gaps == []
+
 
 # ---------------------------------------------------------------------------
 # extract_section

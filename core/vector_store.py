@@ -3,15 +3,16 @@ Pinecone vector database manager for semantic search.
 Handles document embedding, indexing, and similarity search.
 """
 
+import os
 import sys
 sys.path.append(".")
 import time
 from typing import Dict, Any, List
 from langchain_core.documents import Document
-from pinecone import Pinecone, ServerlessSpec       
+from pinecone import Pinecone, ServerlessSpec
 from utils.embeddings import get_embeddings
 from utils.config import (
-    PINECONE_API_KEY, 
+    PINECONE_API_KEY,
     PINECONE_INDEX_NAME,
     PINECONE_DIMENSION,
     PINECONE_METRIC,
@@ -20,20 +21,44 @@ from utils.utils import get_logger, is_quota_error
 
 logger = get_logger(__name__)
 
+
+def _pinecone_proxy_kwargs() -> Dict[str, Any]:
+    """Pinecone's client doesn't read HTTPS_PROXY/SSL_CERT_FILE automatically
+    the way `requests`/`httpx` do — it needs proxy_url/ssl_ca_certs passed in
+    explicitly. Pull them from the standard env vars when present so this
+    works transparently behind an HTTPS-intercepting proxy; a normal
+    deployment without those env vars set gets an empty dict and behaves
+    exactly as before.
+    """
+    kwargs: Dict[str, Any] = {}
+    proxy_url = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
+    if proxy_url:
+        kwargs["proxy_url"] = proxy_url
+    ca_bundle = (
+        os.environ.get("SSL_CERT_FILE")
+        or os.environ.get("REQUESTS_CA_BUNDLE")
+        or os.environ.get("CURL_CA_BUNDLE")
+    )
+    if ca_bundle:
+        kwargs["ssl_ca_certs"] = ca_bundle
+    return kwargs
+
+
 class VectorStore:
     def __init__(self):
         self.client = None
         self.index = None
         self.embeddings = None
-        self._ready = None
+        self._ready = False
 
     def initialize(self) -> bool:
+        self._ready = False
         try:
             if not PINECONE_API_KEY:
                 logger.warning("PINECONE API Key not set. Vector store disabled.")
                 return False
-            
-            self.client = Pinecone(api_key=PINECONE_API_KEY)
+
+            self.client = Pinecone(api_key=PINECONE_API_KEY, **_pinecone_proxy_kwargs())
             logger.info("Pinecone client initialized.")
 
             if not self.ensure_index():
